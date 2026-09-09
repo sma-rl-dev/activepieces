@@ -1,0 +1,408 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Activepieces - Tester Environment CLI
+# Usage: ./tester-env <command> [--ref <git-ref>] [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+#
+# Shape: single container (APP + one embedded worker, WORKER_AND_APP) built from
+# this checkout's source via docker-compose.tester-env.yml, plus Postgres+Redis.
+# First UI signup becomes platform owner; deploy creates the owner via API so
+# testers always LOG IN with fixed credentials.
+
+RUN_ID="default"
+PORT="${PORT:-18100}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.tester-env.yml"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-activepieces}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+# Deterministic owner credentials (>=8 chars password per API schema).
+OWNER_EMAIL="owner@tester-env.local"
+OWNER_PASSWORD="TesterEnv1234!"
+OWNER_FIRST_NAME="Testy"
+OWNER_LAST_NAME="Owner"
+
+# Deterministic baseline fixtures.
+SEED_FOLDER_NAME="Seed Folder"
+SEED_FLOW_NAMES=("New Ticket Triage" "Weekly Escalation Digest" "Supplier Invoice Review")
+SEED_FLOW_FOLDERS=("Customer Support" "Customer Support" "Finance Operations")
+
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"   # post-build health wait
+BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-2400}"    # compose build budget
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+    SUFFIX="${suffix}"
+    # IMAGE_TAG is set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-activepieces:dev}"
+    CONTAINER_NAME="tester-env-activepieces${suffix}"
+    PG_CONTAINER_NAME="tester-env-activepieces-pg${suffix}"
+    REDIS_CONTAINER_NAME="tester-env-activepieces-redis${suffix}"
+    COMPOSE_PROJECT="tester-env-activepieces${suffix}"
+    CACHE_VOLUME="activepieces-cache${suffix}"
+    PG_VOLUME="activepieces-pg-data${suffix}"
+    REDIS_VOLUME="activepieces-redis-data${suffix}"
+}
+
+dc() {
+    IMAGE_NAME="${IMAGE_NAME}" \
+    APP_CONTAINER_NAME="${CONTAINER_NAME}" \
+    PG_CONTAINER_NAME="${PG_CONTAINER_NAME}" \
+    REDIS_CONTAINER_NAME="${REDIS_CONTAINER_NAME}" \
+    HOST_PORT="${PORT}" \
+    NETWORK_NAME="tester-env-activepieces-net${SUFFIX}" \
+    CACHE_VOLUME="${CACHE_VOLUME}" \
+    PG_VOLUME="${PG_VOLUME}" \
+    REDIS_VOLUME="${REDIS_VOLUME}" \
+    AP_FRONTEND_URL="http://localhost:${PORT}" \
+    TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT}" \
+    TESTER_ENV_APP="${TESTER_ENV_APP}" \
+    TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO}" \
+    TESTER_ENV_RUN_ID="${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+    docker compose -p "${COMPOSE_PROJECT}" -f "${COMPOSE_FILE}" "$@"
+}
+
+api_base() {
+    echo "http://localhost:${PORT}/api/v1"
+}
+
+http_post_json() {
+    # $1 path, $2 json body -> prints "<status_code>\n<body>"
+    curl -sS --max-time 30 -w $'\n%{http_code}' -X POST "$(api_base)$1" \
+        -H 'Content-Type: application/json' -d "$2" 2>/dev/null || printf '\n000'
+}
+
+json_field() {
+    # $1 json body, $2 field name -> prints raw string value or empty
+    printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -n1 | cut -d'"' -f4 || true
+}
+
+owner_sign_in() {
+    # Prints "<code>\n<response>"; response carries token + projectId on success.
+    http_post_json "/authentication/sign-in" \
+        "{\"email\":\"${OWNER_EMAIL}\",\"password\":\"${OWNER_PASSWORD}\"}"
+}
+
+create_owner() {
+    echo "==> Creating platform owner account (${OWNER_EMAIL})..."
+    local resp code body token project_id
+    resp=$(http_post_json "/authentication/sign-up" \
+        "{\"email\":\"${OWNER_EMAIL}\",\"password\":\"${OWNER_PASSWORD}\",\"firstName\":\"${OWNER_FIRST_NAME}\",\"lastName\":\"${OWNER_LAST_NAME}\",\"trackEvents\":false,\"newsLetter\":false}")
+    code="$(printf '%s' "${resp}" | tail -n1)"
+    body="$(printf '%s' "${resp}" | sed '$d')"
+
+    if [[ "${code}" == "200" ]]; then
+        # First signup returns an ONBOARDING token with projectId=null; complete
+        # onboarding so the platform + first project are provisioned.
+        token="$(json_field "${body}" token)"
+        resp=$(curl -sS --max-time 30 -w $'\n%{http_code}' -X POST "$(api_base)/authentication/complete-sign-up" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ${token}" \
+            -d "{\"fullName\":\"${OWNER_FIRST_NAME} ${OWNER_LAST_NAME}\"}")
+        code="$(printf '%s' "${resp}" | tail -n1)"
+        body="$(printf '%s' "${resp}" | sed '$d')"
+        if [[ "${code}" != "200" ]]; then
+            echo "ERROR: complete-sign-up failed (HTTP ${code}); platform/project not provisioned." >&2
+            exit 1
+        fi
+        project_id="$(json_field "${body}" projectId)"
+        echo "==> Owner account created (projectId=${project_id:-unknown})."
+        return 0
+    fi
+
+    # Idempotent redeploy: owner may already exist; sign-in must then succeed
+    # and carry a project (platform already provisioned).
+    echo "==> Sign-up returned ${code}; checking existing owner via sign-in..."
+    resp=$(owner_sign_in)
+    code="$(printf '%s' "${resp}" | tail -n1)"
+    if [[ "${code}" == "200" ]]; then
+        body="$(printf '%s' "${resp}" | sed '$d')"
+        project_id="$(json_field "${body}" projectId)"
+        if [[ -z "${project_id}" ]]; then
+            echo "WARNING: owner signs in but has no projectId (onboarding not completed)."
+        fi
+        echo "==> Owner account already exists and signs in. OK."
+        return 0
+    fi
+    echo "ERROR: could not create owner (sign-up HTTP ${code}) and sign-in failed." >&2
+    printf '%s\n' "${body}" >&2 | head -c 2000 || true
+    return 1
+}
+
+wait_for_health() {
+    local url="$(api_base)/health"
+    local deadline=$(( $(date +%s) + HEALTH_TIMEOUT_SECONDS ))
+    echo "==> Waiting for healthy app at ${url} (up to ${HEALTH_TIMEOUT_SECONDS}s)..."
+    while true; do
+        local code
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${url}" 2>/dev/null || echo 000)"
+        if [[ "${code}" == "200" ]]; then
+            echo "==> Health check OK (HTTP 200)."
+            return 0
+        fi
+        if (( $(date +%s) > deadline )); then
+            echo "ERROR: health check timed out after ${HEALTH_TIMEOUT_SECONDS}s (last code ${code})." >&2
+            echo "Inspect with: ./tester-env logs" >&2
+            return 1
+        fi
+        sleep 5
+    done
+}
+
+cmd_deploy() {
+    local ref="${1:-}"
+
+    if [[ -n "${ref}" ]]; then
+        echo "==> Checking out ref: ${ref}"
+        git -C "${SCRIPT_DIR}" checkout "${ref}"
+        echo "==> Checkout now at: $(git -C "${SCRIPT_DIR}" rev-parse HEAD)"
+    fi
+
+    echo "==> Building image ${IMAGE_NAME} from source (first build can take 10-30 min)..."
+    dc build app
+
+    echo "==> Starting containers (project ${COMPOSE_PROJECT}, port ${PORT})..."
+    dc up -d
+
+    wait_for_health
+    create_owner
+
+    echo "==> Deployment complete."
+    echo "==> URL: http://localhost:${PORT}"
+    echo "==> Credentials: ${OWNER_EMAIL} / ${OWNER_PASSWORD}"
+}
+
+cmd_seed() {
+    echo "==> Seeding deterministic baseline..."
+    local resp code body token project_id folders
+    resp=$(owner_sign_in)
+    code="$(printf '%s' "${resp}" | tail -n1)"
+    body="$(printf '%s' "${resp}" | sed '$d')"
+    if [[ "${code}" != "200" ]]; then
+        echo "ERROR: owner sign-in failed (HTTP ${code}); run './tester-env deploy' first." >&2
+        exit 1
+    fi
+    token="$(json_field "${body}" token)"
+    project_id="$(json_field "${body}" projectId)"
+    if [[ -z "${token}" || -z "${project_id}" ]]; then
+        echo "ERROR: sign-in returned no token/projectId; owner onboarding incomplete?" >&2
+        exit 1
+    fi
+
+    folders=$(curl -sS --max-time 30 "$(api_base)/folders?projectId=${project_id}&limit=20" \
+        -H "Authorization: Bearer ${token}")
+    if ! printf '%s' "${folders}" | jq -e --arg name "${SEED_FOLDER_NAME}" '.data[] | select(.displayName == $name)' >/dev/null; then
+    resp=$(curl -sS --max-time 30 -w $'\n%{http_code}' -X POST "$(api_base)/folders" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        -d "{\"displayName\":\"${SEED_FOLDER_NAME}\",\"projectId\":\"${project_id}\"}")
+    code="$(printf '%s' "${resp}" | tail -n1)"
+    if [[ "${code}" != "200" ]]; then
+        echo "ERROR: folder creation failed (HTTP ${code})." >&2
+        exit 1
+    fi
+    echo "==> Seeded folder '${SEED_FOLDER_NAME}' in project ${project_id}."
+    else
+        echo "==> Seeded folder '${SEED_FOLDER_NAME}' already exists."
+    fi
+
+    for i in "${!SEED_FLOW_NAMES[@]}"; do
+        local name="${SEED_FLOW_NAMES[i]}"
+        local folder="${SEED_FLOW_FOLDERS[i]}"
+        local flows
+        flows=$(curl -sS --max-time 30 "$(api_base)/flows?projectId=${project_id}&limit=20" \
+            -H "Authorization: Bearer ${token}")
+        if printf '%s' "${flows}" | jq -e --arg name "${name}" '.data[] | select(.version.displayName == $name)' >/dev/null; then
+            echo "==> Seeded flow '${name}' already exists."
+            continue
+        fi
+        resp=$(curl -sS --max-time 30 -w $'\n%{http_code}' -X POST "$(api_base)/flows" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ${token}" \
+            -d "{\"displayName\":\"${name}\",\"folderName\":\"${folder}\",\"projectId\":\"${project_id}\"}")
+        code="$(printf '%s' "${resp}" | tail -n1)"
+        if [[ "${code}" != "201" ]]; then
+            echo "ERROR: flow creation failed for '${name}' (HTTP ${code})." >&2
+            exit 1
+        fi
+        echo "==> Seeded draft flow '${name}' in '${folder}'."
+    done
+}
+
+cmd_verify() {
+    echo "==> Verifying owner login via API..."
+    local resp code body token project_id folders flows
+    resp=$(owner_sign_in)
+    code="$(printf '%s' "${resp}" | tail -n1)"
+    body="$(printf '%s' "${resp}" | sed '$d')"
+    if [[ "${code}" != "200" ]]; then
+        echo "FAIL: owner sign-in returned HTTP ${code}." >&2
+        exit 1
+    fi
+    token="$(json_field "${body}" token)"
+    if [[ -z "${token}" ]]; then
+        echo "FAIL: sign-in returned no token." >&2
+        exit 1
+    fi
+    echo "PASS: owner sign-in returned a token."
+
+    echo "==> Verifying seeded fixture is visible..."
+    project_id="$(json_field "${body}" projectId)"
+    if [[ -z "${project_id}" ]]; then
+        echo "FAIL: sign-in response carries no projectId (onboarding incomplete)." >&2
+        exit 1
+    fi
+    folders="$(curl -sS --max-time 30 "$(api_base)/folders?projectId=${project_id}&limit=20" \
+        -H "Authorization: Bearer ${token}")"
+    if printf '%s' "${folders}" | jq -e --arg name "${SEED_FOLDER_NAME}" '.data[] | select(.displayName == $name)' >/dev/null; then
+        echo "PASS: seeded folder '${SEED_FOLDER_NAME}' visible via API."
+    else
+        echo "FAIL: seeded folder '${SEED_FOLDER_NAME}' not found; run './tester-env seed' first." >&2
+        exit 1
+    fi
+    if ! printf '%s' "${folders}" | jq -e '.data | length == 3 and ([.[] | select(.displayName == "Customer Support" and .numberOfFlows == 2)] | length == 1) and ([.[] | select(.displayName == "Finance Operations" and .numberOfFlows == 1)] | length == 1)' >/dev/null; then
+        echo "FAIL: expected three folders with two support flows and one finance flow." >&2
+        exit 1
+    fi
+    echo "PASS: Customer Support and Finance Operations folders visible via API."
+
+    flows="$(curl -sS --max-time 30 "$(api_base)/flows?projectId=${project_id}&limit=20" -H "Authorization: Bearer ${token}")"
+    if ! printf '%s' "${flows}" | jq -e --argjson names "$(printf '%s\n' "${SEED_FLOW_NAMES[@]}" | jq -R . | jq -s .)" '.data | length == 3 and ([.[] | select(.version.displayName as $name | $names | index($name)) | select(.status == "DISABLED" and .version.state == "DRAFT")] | length == 3)' >/dev/null; then
+        echo "FAIL: expected three named disabled draft flows." >&2
+        exit 1
+    fi
+    echo "PASS: three named disabled draft flows visible via API."
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (containers + volumes; image is kept)..."
+    dc down -v --remove-orphans >/dev/null 2>&1 || true
+    echo "==> Reset complete. Run './tester-env deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping containers (data preserved)..."
+    dc stop
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    dc logs -f --tail=200 app
+}
+
+cmd_status() {
+    if docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
+        local code
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$(api_base)/health" 2>/dev/null || echo 000)"
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Health: /api/v1/health -> HTTP ${code}"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Project: ${COMPOSE_PROJECT}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+Activepieces - Tester Environment CLI
+
+Usage: ./tester-env <command> [--ref <git-ref>] [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build image from source, start app+postgres+redis, wait for health,
+            create deterministic platform owner via API
+  seed      Create deterministic folders and three draft flows
+  verify    Assert owner login and seeded folders/flows are visible (API)
+  reset     Remove containers + volumes (image kept) for a clean slate
+  stop      Stop containers (preserves volumes/data)
+  logs      Tail app container logs
+  status    Show run status, URL, and health result
+  help      Show this help message
+
+Options:
+  --ref <git-ref>   Git ref to checkout before deploy (scenario baselines/mutants)
+  --run-id <id>     Isolate containers/volumes/project for parallel runs
+                    Default: default
+  --port <port>     Host port for the app (container serves port 80)
+                    Default: 18100 (env PORT also honored)
+
+Typical workflow:
+  ./tester-env reset && ./tester-env deploy   # Clean source-built deployment
+  ./tester-env seed                           # Deterministic fixture
+  ./tester-env verify                         # Assert login + seeded state
+
+Credentials (deterministic): ${OWNER_EMAIL} / ${OWNER_PASSWORD}
+First UI signup would become platform owner; deploy pre-creates the owner via
+POST /api/v1/authentication/sign-up so testers only ever log in.
+
+Env vars honored:
+  IMAGE_TAG               Image tag override (content-addressed tags from rl-env)
+  PORT                    Default host port
+  HEALTH_TIMEOUT_SECONDS  Post-build health wait budget (default 300)
+  BUILD_TIMEOUT_SECONDS   Compose build budget in seconds (default 2400)
+
+Notes:
+  - Single container runs APP + one embedded worker (AP_CONTAINER_TYPE=WORKER_AND_APP).
+  - AP_WORKER_TOKEN is auto-derived at entrypoint from the pinned AP_JWT_SECRET,
+    so app/worker auth works without an extra pin.
+  - Telemetry disabled; templates source overridden to avoid external fetches.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    local ref=""
+
+    for ((i=2; i<=$#; i++)); do
+        local arg="${!i}"
+        case "${arg}" in
+            --ref)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then ref="${!next}"; ((i++)); else
+                    echo "Error: --ref requires a value"; exit 1; fi
+                ;;
+            --run-id)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then RUN_ID="${!next}"; ((i++)); else
+                    echo "Error: --run-id requires a value"; exit 1; fi
+                ;;
+            --port)
+                local next=$((i+1))
+                if [[ ${next} -le $# ]]; then PORT="${!next}"; ((i++)); else
+                    echo "Error: --port requires a value"; exit 1; fi
+                ;;
+            --help|-h)
+                cmd_help; exit 0;;
+            *)
+                echo "Unknown option: ${arg}"; cmd_help; exit 1;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy "${ref}" ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *)
+            echo "Unknown command: ${cmd}"
+            cmd_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

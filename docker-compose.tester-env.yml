@@ -1,0 +1,110 @@
+# tester-env deployment overlay for Activepieces — builds from this checkout's
+# source (root Dockerfile). Invoked only by ./tester-env; does not shadow the
+# upstream docker-compose.yml.
+#
+# Shape: one app container running APP + a single embedded worker
+# (AP_CONTAINER_TYPE=WORKER_AND_APP), plus Postgres (pgvector) and Redis.
+# All names, ports, and volumes are injected by ./tester-env so RUN_ID can
+# scope containers/volumes for parallel runs.
+#
+# Image name honors IMAGE_TAG (content-addressed tag from scripts/rl-env).
+# RUN_ID must never leak into the image name.
+
+services:
+  app:
+    image: ${IMAGE_NAME:-tester-env-activepieces:dev}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ${APP_CONTAINER_NAME:-tester-env-activepieces}
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      - AP_CONTAINER_TYPE=WORKER_AND_APP
+      - AP_PORT=80
+      - AP_ENVIRONMENT=prod
+      - AP_ENGINE_EXECUTABLE_PATH=dist/packages/engine/main.js
+      # Fixed pins so every run is byte-identical in behavior. 32-hex encryption key.
+      - AP_ENCRYPTION_KEY=${AP_ENCRYPTION_KEY:-a3f8d2c1e5b7094fa6c3e81b2d5f0a74}
+      - AP_JWT_SECRET=${AP_JWT_SECRET:-tester-env-activepieces-fixed-jwt-secret-0123456789abcdef}
+      - AP_TELEMETRY_ENABLED=false
+      # Avoid external template fetches at runtime config level. Note: in 0.88.3 the
+      # community-templates URL is hardcoded upstream and fetched lazily only if a
+      # user browses the Templates UI page.
+      - AP_TEMPLATES_SOURCE_URL=${AP_TEMPLATES_SOURCE_URL:-}
+      - AP_FRONTEND_URL=${AP_FRONTEND_URL:-http://localhost:18100}
+      - AP_WEBHOOK_TIMEOUT_SECONDS=30
+      - AP_TRIGGER_DEFAULT_POLL_INTERVAL=5
+      - AP_EXECUTION_MODE=UNSANDBOXED
+      - AP_FLOW_TIMEOUT_SECONDS=600
+      - AP_POSTGRES_HOST=postgres
+      - AP_POSTGRES_PORT=5432
+      - AP_POSTGRES_DATABASE=activepieces
+      - AP_POSTGRES_USERNAME=postgres
+      - AP_POSTGRES_PASSWORD=${AP_POSTGRES_PASSWORD:-tester-env-pg-pass}
+      - AP_REDIS_HOST=redis
+      - AP_REDIS_PORT=6379
+    ports:
+      - "${HOST_PORT:-18100}:80"
+    volumes:
+      - cache:/usr/src/app/cache
+    labels:
+      - tester-env.project=tester-env
+      - tester-env.app=activepieces
+      - tester-env.scenario=${TESTER_ENV_SCENARIO:-manual}
+      - tester-env.run_id=${TESTER_ENV_RUN_ID:-default}
+    networks:
+      - activepieces
+
+  postgres:
+    image: pgvector/pgvector:0.8.0-pg14
+    container_name: ${PG_CONTAINER_NAME:-tester-env-activepieces-pg}
+    restart: "no"
+    environment:
+      - POSTGRES_DB=activepieces
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=${AP_POSTGRES_PASSWORD:-tester-env-pg-pass}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d activepieces"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    labels:
+      - tester-env.project=tester-env
+      - tester-env.app=activepieces
+      - tester-env.scenario=${TESTER_ENV_SCENARIO:-manual}
+      - tester-env.run_id=${TESTER_ENV_RUN_ID:-default}
+    networks:
+      - activepieces
+
+  redis:
+    image: redis:7.0.7
+    container_name: ${REDIS_CONTAINER_NAME:-tester-env-activepieces-redis}
+    restart: "no"
+    volumes:
+      - redisdata:/data
+    labels:
+      - tester-env.project=tester-env
+      - tester-env.app=activepieces
+      - tester-env.scenario=${TESTER_ENV_SCENARIO:-manual}
+      - tester-env.run_id=${TESTER_ENV_RUN_ID:-default}
+    networks:
+      - activepieces
+
+volumes:
+  cache:
+    name: ${CACHE_VOLUME:-activepieces-cache}
+  pgdata:
+    name: ${PG_VOLUME:-activepieces-pg-data}
+  redisdata:
+    name: ${REDIS_VOLUME:-activepieces-redis-data}
+
+networks:
+  activepieces:
+    name: ${NETWORK_NAME:-tester-env-activepieces-net}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "app": "activepieces",
+  "requirements": {
+    "seed-folder": {
+      "status": "present",
+      "evidence": "Seed Folder is an empty visible folder."
+    },
+    "support-draft-flows": {
+      "status": "present",
+      "evidence": "Customer Support contains disabled draft flows New Ticket Triage and Weekly Escalation Digest."
+    },
+    "finance-draft-flow": {
+      "status": "present",
+      "evidence": "Finance Operations contains the disabled draft flow Supplier Invoice Review."
+    }
+  }
+}
