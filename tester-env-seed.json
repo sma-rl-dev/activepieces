@@ -13,6 +13,30 @@
     "finance-draft-flow": {
       "status": "present",
       "evidence": "Finance Operations contains the disabled draft flow Supplier Invoice Review."
+    },
+    "variables-write-access": {
+      "status": "present",
+      "evidence": "Seeded owner holds project owner permissions including WRITE_VARIABLE; Variables tab visible in project navigation."
+    },
+    "clean-variables-table": {
+      "status": "present",
+      "evidence": "Seed creates no variables, so TESTER_ENV_REVIEW_NOTE does not collide on a fresh deploy."
+    },
+    "platform-pieces-visible": {
+      "status": "present",
+      "evidence": "First signup becomes platform owner per tester-env CLI; owner can open the Platform Pieces management page (/platform/setup/pieces)."
+    },
+    "install-piece-dialog-available": {
+      "status": "present",
+      "evidence": "Pieces page toolbar always renders the Install Piece trigger opening the Install a piece dialog."
+    },
+    "templates-gallery-has-template": {
+      "status": "present",
+      "evidence": "CE backend proxies official templates from https://cloud.activepieces.com/api/v1/templates; host egress verified HTTP 200 with template data on 2026-09-18, so /templates lists templates for the CE plan."
+    },
+    "personal-project-present": {
+      "status": "present",
+      "evidence": "Seed signup creates the owner with a PERSONAL project; getProjectName renders it as Personal Project in the Use Template dialog."
     }
   }
 }
