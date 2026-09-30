@@ -29,6 +29,120 @@ SEED_FOLDER_NAME="Seed Folder"
 SEED_FLOW_NAMES=("New Ticket Triage" "Weekly Escalation Digest" "Supplier Invoice Review")
 SEED_FLOW_FOLDERS=("Customer Support" "Customer Support" "Finance Operations")
 
+TRIAGE_SCHEDULE_PIECE="@activepieces/piece-schedule"
+TRIAGE_SCHEDULE_VERSION="0.1.21"
+TRIAGE_SCHEDULE_TRIGGER="cron_expression"
+TRIAGE_STEP_NAME="step_1"
+TRIAGE_STEP_DISPLAY="Triage ticket"
+
+triage_import_payload() {
+    cat <<'EOF'
+{
+  "type": "IMPORT_FLOW",
+  "request": {
+    "displayName": "New Ticket Triage",
+    "schemaVersion": null,
+    "notes": [],
+    "trigger": {
+      "name": "trigger",
+      "displayName": "Weekday Triage Schedule",
+      "valid": true,
+      "type": "PIECE_TRIGGER",
+      "lastUpdatedDate": "2026-09-30T00:00:00.000Z",
+      "settings": {
+        "pieceName": "@activepieces/piece-schedule",
+        "pieceVersion": "0.1.21",
+        "triggerName": "cron_expression",
+        "input": {"cronExpression": "0 9 * * 1-5", "timezone": "UTC"},
+        "propertySettings": {}
+      },
+      "nextAction": {
+        "name": "step_1",
+        "displayName": "Triage ticket",
+        "valid": true,
+        "type": "CODE",
+        "lastUpdatedDate": "2026-09-30T00:00:00.000Z",
+        "settings": {
+          "sourceCode": {
+            "packageJson": "{\n  \"dependencies\": {}\n}",
+            "code": "export const code = async (inputs) => {\n  return { ticketId: 42, status: \"triaged\", success: true };\n};"
+          },
+          "input": {}
+        }
+      }
+    }
+  }
+}
+EOF
+}
+
+triage_sample_payload() {
+    cat <<'EOF'
+{"type":"SAVE_SAMPLE_DATA","request":{"stepName":"trigger","payload":{},"type":"OUTPUT"}}
+EOF
+}
+
+configure_triage_flow() {
+    local token="$1" project_id="$2"
+    local flows triage flow_id trigger_type step_type has_sample
+    flows=$(curl -sS --max-time 30 "$(api_base)/flows?projectId=${project_id}&limit=20" \
+        -H "Authorization: Bearer ${token}")
+    triage=$(printf '%s' "${flows}" | jq '.data[] | select(.version.displayName == "New Ticket Triage")')
+    if [[ -z "${triage}" ]]; then
+        echo "ERROR: New Ticket Triage flow not found after seeding." >&2
+        exit 1
+    fi
+    flow_id=$(printf '%s' "${triage}" | jq -r '.id')
+    trigger_type=$(printf '%s' "${triage}" | jq -r '.version.trigger.type')
+    step_type=$(printf '%s' "${triage}" | jq -r '.version.trigger.nextAction.type // "MISSING"')
+    has_sample=$(printf '%s' "${triage}" | jq -r '.version.trigger.settings.sampleData.lastTestDate // "MISSING"')
+
+    if [[ "${trigger_type}" == "PIECE_TRIGGER" && "${step_type}" == "CODE" && "${has_sample}" != "MISSING" ]]; then
+        echo "==> New Ticket Triage already configured (schedule trigger, Code step, trigger sample data)."
+        return 0
+    fi
+
+    if [[ "${trigger_type}" != "PIECE_TRIGGER" || "${step_type}" != "CODE" ]]; then
+        echo "==> Configuring New Ticket Triage content (schedule trigger + Triage ticket Code step)..."
+        local resp code body
+        resp=$(curl -sS --max-time 60 -w $'\n%{http_code}' -X POST "$(api_base)/flows/${flow_id}" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer ${token}" \
+            -d "$(triage_import_payload)")
+        code="$(printf '%s' "${resp}" | tail -n1)"
+        body="$(printf '%s' "${resp}" | sed '$d')"
+        if [[ "${code}" != "200" ]]; then
+            echo "ERROR: triage IMPORT_FLOW failed (HTTP ${code})." >&2
+            printf '%s\n' "${body}" >&2 | head -c 2000 || true
+            exit 1
+        fi
+        if ! printf '%s' "${body}" | jq -e '.version.valid == true and .version.trigger.valid == true and .version.trigger.nextAction.valid == true' >/dev/null; then
+            echo "ERROR: imported triage content is not valid; refusing to seed an unusable fixture." >&2
+            exit 1
+        fi
+        echo "==> New Ticket Triage content imported (valid schedule trigger + Code step)."
+    fi
+
+    echo "==> Saving trigger sample data for New Ticket Triage..."
+    local resp code body
+    resp=$(curl -sS --max-time 60 -w $'\n%{http_code}' -X POST "$(api_base)/flows/${flow_id}" \
+        -H 'Content-Type: application/json' \
+        -H "Authorization: Bearer ${token}" \
+        -d "$(triage_sample_payload)")
+    code="$(printf '%s' "${resp}" | tail -n1)"
+    body="$(printf '%s' "${resp}" | sed '$d')"
+    if [[ "${code}" != "200" ]]; then
+        echo "ERROR: triage SAVE_SAMPLE_DATA failed (HTTP ${code})." >&2
+        printf '%s\n' "${body}" >&2 | head -c 2000 || true
+        exit 1
+    fi
+    if ! printf '%s' "${body}" | jq -e '.version.trigger.settings.sampleData.lastTestDate != null' >/dev/null; then
+        echo "ERROR: trigger sample data missing lastTestDate; Test Flow would stay disabled." >&2
+        exit 1
+    fi
+    echo "==> Trigger sample data saved (Test Flow gate satisfied)."
+}
+
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"   # post-build health wait
 BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-2400}"    # compose build budget
 
@@ -233,6 +347,8 @@ cmd_seed() {
         fi
         echo "==> Seeded draft flow '${name}' in '${folder}'."
     done
+
+    configure_triage_flow "${token}" "${project_id}"
 }
 
 cmd_verify() {
@@ -278,6 +394,39 @@ cmd_verify() {
         exit 1
     fi
     echo "PASS: three named disabled draft flows visible via API."
+
+    echo "==> Verifying New Ticket Triage carries configured runnable content..."
+    local triage
+    triage=$(printf '%s' "${flows}" | jq '.data[] | select(.version.displayName == "New Ticket Triage")')
+    if [[ -z "${triage}" ]]; then
+        echo "FAIL: New Ticket Triage flow missing; run './tester-env seed' first." >&2
+        exit 1
+    fi
+    if ! printf '%s' "${triage}" | jq -e '.version.trigger.type == "PIECE_TRIGGER"' >/dev/null; then
+        echo "FAIL: New Ticket Triage has an empty trigger (no configured steps); re-run './tester-env seed'." >&2
+        exit 1
+    fi
+    echo "PASS: New Ticket Triage trigger is configured (not EMPTY)."
+    if ! printf '%s' "${triage}" | jq -e --arg piece "${TRIAGE_SCHEDULE_PIECE}" --arg ver "${TRIAGE_SCHEDULE_VERSION}" --arg trig "${TRIAGE_SCHEDULE_TRIGGER}" '.version.trigger.valid == true and .version.trigger.settings.pieceName == $piece and .version.trigger.settings.pieceVersion == $ver and .version.trigger.settings.triggerName == $trig and .version.trigger.settings.input.cronExpression == "0 9 * * 1-5" and .version.trigger.settings.input.timezone == "UTC"' >/dev/null; then
+        echo "FAIL: New Ticket Triage schedule trigger is missing or invalid." >&2
+        exit 1
+    fi
+    echo "PASS: schedule trigger (cron weekdays 09:00 UTC) valid via API."
+    if ! printf '%s' "${triage}" | jq -e --arg name "${TRIAGE_STEP_NAME}" --arg display "${TRIAGE_STEP_DISPLAY}" '.version.trigger.nextAction.name == $name and .version.trigger.nextAction.displayName == $display and .version.trigger.nextAction.type == "CODE" and .version.trigger.nextAction.valid == true and (.version.trigger.nextAction.settings.sourceCode.code | contains("ticketId: 42") and contains("triaged") and contains("success: true"))' >/dev/null; then
+        echo "FAIL: Triage ticket Code step missing, invalid, or without the fixed return object." >&2
+        exit 1
+    fi
+    echo "PASS: Triage ticket Code step configured with the fixed return object."
+    if ! printf '%s' "${triage}" | jq -e '.version.trigger.settings.sampleData.lastTestDate != null' >/dev/null; then
+        echo "FAIL: trigger sample data missing; builder Test Flow would stay disabled." >&2
+        exit 1
+    fi
+    echo "PASS: trigger sample data present (Test Flow gate satisfied)."
+    if ! printf '%s' "${triage}" | jq -e '.version.valid == true' >/dev/null; then
+        echo "FAIL: New Ticket Triage version is not valid; Test Flow would not render." >&2
+        exit 1
+    fi
+    echo "PASS: New Ticket Triage version valid."
 }
 
 cmd_reset() {
@@ -319,8 +468,11 @@ Usage: ./tester-env <command> [--ref <git-ref>] [--run-id <id>] [--port <port>]
 Commands:
   deploy    Build image from source, start app+postgres+redis, wait for health,
             create deterministic platform owner via API
-  seed      Create deterministic folders and three draft flows
-  verify    Assert owner login and seeded folders/flows are visible (API)
+  seed      Create deterministic folders, three draft flows, and the
+            configured New Ticket Triage content (schedule trigger,
+            Triage ticket Code step, trigger sample data)
+  verify    Assert owner login, seeded folders/flows, and configured
+            triage content are visible (API)
   reset     Remove containers + volumes (image kept) for a clean slate
   stop      Stop containers (preserves volumes/data)
   logs      Tail app container logs

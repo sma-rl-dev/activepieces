@@ -22,6 +22,18 @@ Password: TesterEnv1234!
 `IMAGE_TAG` is honored for content-addressed scenario images; `RUN_ID` scopes
 containers and volumes through `--run-id`.
 
+## Worker self-callback
+
+The embedded worker resolves piece bundles and dynamic property options
+(`POST /api/v1/pieces/options`, `EXECUTE_PROPERTY` jobs) through the public
+API URL derived from `AP_FRONTEND_URL` (`http://localhost:<host-port>`). That
+host port does not exist inside the app container, so without a fix every
+dynamic piece dropdown fails with `fetch failed` server-side and renders
+`Unexpected error, please retry` in the builder (HTTP `Body Type` cannot reach
+JSON). The entrypoint therefore forwards loopback `<host-port>` to the app
+port (`AP_PORT`, 80) with a small node TCP proxy; `HOST_PORT` is injected by
+`docker-compose.tester-env.yml`. No browser-facing URL changes.
+
 ## Reset and inspect
 
 ```bash

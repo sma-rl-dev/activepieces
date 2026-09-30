@@ -7,8 +7,8 @@
       "evidence": "Seed Folder is an empty visible folder."
     },
     "support-draft-flows": {
-      "status": "present",
-      "evidence": "Customer Support contains disabled draft flows New Ticket Triage and Weekly Escalation Digest."
+      "evidence": "Customer Support contains disabled draft flows New Ticket Triage and Weekly Escalation Digest. New Ticket Triage is configured: valid schedule trigger (Weekday Triage Schedule, cron weekdays 09:00 UTC) plus a valid Triage ticket Code step returning { ticketId: 42, status: triaged, success: true } with trigger OUTPUT sample data saved; version.valid is true so the builder Test Flow widget renders enabled.",
+      "status": "present"
     },
     "finance-draft-flow": {
       "status": "present",
@@ -37,6 +37,22 @@
     "personal-project-present": {
       "status": "present",
       "evidence": "Seed signup creates the owner with a PERSONAL project; getProjectName renders it as Personal Project in the Use Template dialog."
+    },
+    "triage-configured-code-step": {
+      "evidence": "New Ticket Triage step_1 is a valid CODE step named Triage ticket whose sourceCode returns the fixed object { ticketId: 42, status: triaged, success: true }; selecting it opens the step settings panel without the piece picker.",
+      "status": "present"
+    },
+    "triage-configured-trigger": {
+      "evidence": "New Ticket Triage trigger is PIECE_TRIGGER @activepieces/piece-schedule@0.1.21 cron_expression with input { cronExpression: 0 9 * * 1-5, timezone: UTC }, valid true, connection-free.",
+      "status": "present"
+    },
+    "triage-testable-draft": {
+      "evidence": "Draft stays DISABLED/DRAFT with version.valid true and trigger sampleData.lastTestDate set, so the builder Test Flow button renders enabled. Executing the test run additionally requires the deployment to serve the engine piece-bundle endpoint in-container (see seed manifest constraints).",
+      "status": "present"
+    },
+    "triage-trigger-sample-data": {
+      "evidence": "Seed saves trigger OUTPUT sample data ({}) via SAVE_SAMPLE_DATA, setting sampleData.lastTestDate, which is the exact frontend gate for enabling Test Flow.",
+      "status": "present"
     }
   }
 }

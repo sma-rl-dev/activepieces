@@ -48,6 +48,7 @@ services:
       - AP_POSTGRES_PASSWORD=${AP_POSTGRES_PASSWORD:-tester-env-pg-pass}
       - AP_REDIS_HOST=redis
       - AP_REDIS_PORT=6379
+      - HOST_PORT=${HOST_PORT:-18100}
     ports:
       - "${HOST_PORT:-18100}:80"
     volumes:

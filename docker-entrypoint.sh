@@ -28,6 +28,28 @@ fi
 APP_SCRIPT="packages/server/api/dist/src/bootstrap.js"
 WORKER_SCRIPT="packages/server/worker/dist/src/bootstrap.js"
 
+FORWARD_PID=""
+if [ -n "${HOST_PORT:-}" ] && [ "${HOST_PORT}" != "${AP_PORT}" ]; then
+    node -e "
+        const net = require('net');
+        const from = parseInt(process.env.HOST_PORT, 10);
+        const to = parseInt(process.env.AP_PORT || '80', 10);
+        for (const host of ['127.0.0.1', '::1']) {
+            const server = net.createServer((client) => {
+                const upstream = net.connect(to, '127.0.0.1', () => {
+                    client.pipe(upstream);
+                    upstream.pipe(client);
+                });
+                upstream.on('error', () => client.destroy());
+                client.on('error', () => upstream.destroy());
+            });
+            server.on('error', (err) => console.error('port-forward ' + host + ':' + from + ' failed: ' + err.message));
+            server.listen(from, host, () => console.log('forwarding ' + host + ':' + from + ' -> 127.0.0.1:' + to));
+        }
+    " &
+    FORWARD_PID=$!
+fi
+
 echo "Starting Activepieces (${AP_CONTAINER_TYPE} mode)"
 
 case "$AP_CONTAINER_TYPE" in
@@ -43,13 +65,13 @@ case "$AP_CONTAINER_TYPE" in
         node --enable-source-maps "$WORKER_SCRIPT" &
         worker_pid=$!
 
-        trap 'kill "$app_pid" "$worker_pid" 2>/dev/null' TERM INT
+        trap 'kill "$app_pid" "$worker_pid" "$FORWARD_PID" 2>/dev/null' TERM INT
 
         while kill -0 "$app_pid" 2>/dev/null && kill -0 "$worker_pid" 2>/dev/null; do
             sleep 1
         done
 
-        kill "$app_pid" "$worker_pid" 2>/dev/null
+        kill "$app_pid" "$worker_pid" "$FORWARD_PID" 2>/dev/null
         exit 1
         ;;
     *)
