@@ -21,6 +21,19 @@ Password: TesterEnv1234!
 `PORT=18100` is the default. Override it with `--port <port>` or `PORT=<port>`.
 `IMAGE_TAG` is honored for content-addressed scenario images; `RUN_ID` scopes
 containers and volumes through `--run-id`.
+`PIECES_TIMEOUT_SECONDS` (default 600) bounds the piece-catalog readiness wait.
+
+## Piece catalog readiness
+
+The app syncs ~13k piece rows from the cloud in the background after first
+boot (latest versions land in under a minute; the full registry takes ~6 min
+in 0.88.3, latest-first). Deploy therefore waits until the metadata the
+scenarios need resolves: `@activepieces/piece-schedule` at the pinned seed
+version (an old row that arrives late in the stream) and
+`@activepieces/piece-http` latest with the `send_request` action. If the
+budget expires, deploy fails loudly instead of reporting a healthy app with a
+partial catalog; rerunning deploy resumes the sync incrementally on the same
+volumes.
 
 ## Worker self-callback
 

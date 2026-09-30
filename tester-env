@@ -35,6 +35,8 @@ TRIAGE_SCHEDULE_TRIGGER="cron_expression"
 TRIAGE_STEP_NAME="step_1"
 TRIAGE_STEP_DISPLAY="Triage ticket"
 
+REQUIRED_HTTP_PIECE="@activepieces/piece-http"
+
 triage_import_payload() {
     cat <<'EOF'
 {
@@ -145,6 +147,7 @@ configure_triage_flow() {
 
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"   # post-build health wait
 BUILD_TIMEOUT_SECONDS="${BUILD_TIMEOUT_SECONDS:-2400}"    # compose build budget
+PIECES_TIMEOUT_SECONDS="${PIECES_TIMEOUT_SECONDS:-600}"
 
 refresh_names() {
     local suffix=""
@@ -269,6 +272,40 @@ wait_for_health() {
     done
 }
 
+wait_for_pieces() {
+    local deadline=$(( $(date +%s) + PIECES_TIMEOUT_SECONDS ))
+    echo "==> Waiting for piece catalog (${TRIAGE_SCHEDULE_PIECE}@${TRIAGE_SCHEDULE_VERSION}, ${REQUIRED_HTTP_PIECE} latest; up to ${PIECES_TIMEOUT_SECONDS}s)..."
+    while true; do
+        local resp code body token project_id sched http http_version
+        sched="?"
+        resp=$(owner_sign_in)
+        code="$(printf '%s' "${resp}" | tail -n1)"
+        body="$(printf '%s' "${resp}" | sed '$d')"
+        if [[ "${code}" == "200" ]]; then
+            token="$(json_field "${body}" token)"
+            project_id="$(json_field "${body}" projectId)"
+            if [[ -n "${token}" && -n "${project_id}" ]]; then
+                sched=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$(api_base)/pieces/${TRIAGE_SCHEDULE_PIECE}?version=${TRIAGE_SCHEDULE_VERSION}&projectId=${project_id}" -H "Authorization: Bearer ${token}" 2>/dev/null || echo 000)
+                if [[ "${sched}" == "200" ]]; then
+                    http=$(curl -sS --max-time 30 "$(api_base)/pieces/${REQUIRED_HTTP_PIECE}?projectId=${project_id}" -H "Authorization: Bearer ${token}" 2>/dev/null || echo '{}')
+                    if printf '%s' "${http}" | jq -e '.actions.send_request != null' >/dev/null 2>&1; then
+                        http_version=$(printf '%s' "${http}" | jq -r '.version')
+                        echo "==> Piece catalog ready (schedule ${TRIAGE_SCHEDULE_VERSION}, http ${http_version})."
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        if (( $(date +%s) > deadline )); then
+            echo "ERROR: piece catalog not ready after ${PIECES_TIMEOUT_SECONDS}s (schedule metadata HTTP ${sched})." >&2
+            echo "Required: ${TRIAGE_SCHEDULE_PIECE}@${TRIAGE_SCHEDULE_VERSION} metadata and ${REQUIRED_HTTP_PIECE} latest with the send_request action." >&2
+            echo "The cloud piece sync is still streaming; rerun './tester-env deploy' (sync resumes incrementally on the same volumes) or inspect with './tester-env logs'." >&2
+            return 1
+        fi
+        sleep 10
+    done
+}
+
 cmd_deploy() {
     local ref="${1:-}"
 
@@ -286,6 +323,7 @@ cmd_deploy() {
 
     wait_for_health
     create_owner
+    wait_for_pieces
 
     echo "==> Deployment complete."
     echo "==> URL: http://localhost:${PORT}"
@@ -467,7 +505,7 @@ Usage: ./tester-env <command> [--ref <git-ref>] [--run-id <id>] [--port <port>]
 
 Commands:
   deploy    Build image from source, start app+postgres+redis, wait for health,
-            create deterministic platform owner via API
+            create deterministic platform owner, wait for piece catalog via API
   seed      Create deterministic folders, three draft flows, and the
             configured New Ticket Triage content (schedule trigger,
             Triage ticket Code step, trigger sample data)
@@ -500,6 +538,7 @@ Env vars honored:
   PORT                    Default host port
   HEALTH_TIMEOUT_SECONDS  Post-build health wait budget (default 300)
   BUILD_TIMEOUT_SECONDS   Compose build budget in seconds (default 2400)
+  PIECES_TIMEOUT_SECONDS  Piece catalog readiness budget in seconds (default 600)
 
 Notes:
   - Single container runs APP + one embedded worker (AP_CONTAINER_TYPE=WORKER_AND_APP).
