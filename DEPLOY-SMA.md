@@ -26,14 +26,31 @@ containers and volumes through `--run-id`.
 ## Piece catalog readiness
 
 The app syncs ~13k piece rows from the cloud in the background after first
-boot (latest versions land in under a minute; the full registry takes ~6 min
-in 0.88.3, latest-first). Deploy therefore waits until the metadata the
-scenarios need resolves: `@activepieces/piece-schedule` at the pinned seed
-version (an old row that arrives late in the stream) and
-`@activepieces/piece-http` latest with the `send_request` action. If the
-budget expires, deploy fails loudly instead of reporting a healthy app with a
-partial catalog; rerunning deploy resumes the sync incrementally on the same
-volumes.
+boot (about 6 min solo, ~10 min with two parallel clean deploys in 0.88.3,
+latest-first). Two properties make a plain wait unreliable: the API freezes
+its in-process piece registry on the first metadata read, so metadata/options
+calls stay blind until the streaming sync ends and invalidates it; and the
+seed-pinned `@activepieces/piece-schedule@0.1.21` is an old row that only
+lands at the tail of the stream.
+
+Deploy therefore pre-inserts a minimal snapshot (schedule 0.1.21, http
+0.12.1, byte-identical to what the sync stores) into Postgres before the
+first metadata read, then waits until both metadata GETs resolve. The
+background sync skips existing rows and keeps streaming the rest; the
+DELETE+INSERT runs in one transaction, so re-deploying over existing volumes
+is safe. If the budget (`PIECES_TIMEOUT_SECONDS`, default 600) expires,
+deploy fails loudly instead of reporting a healthy app with a partial
+catalog; rerunning deploy resumes the sync incrementally on the same volumes.
+
+Regenerate the embedded snapshot when the pinned versions change:
+
+```bash
+mkdir -p ../../.work/tmp/activepieces-snapshot
+curl -fsS "https://cloud.activepieces.com/api/v1/pieces/@activepieces/piece-schedule?version=<ver>" -o ../../.work/tmp/activepieces-snapshot/schedule.json
+curl -fsS "https://cloud.activepieces.com/api/v1/pieces/@activepieces/piece-http?version=<ver>" -o ../../.work/tmp/activepieces-snapshot/http.json
+# emit DELETE+INSERT for piece_metadata replicating pieceMetadataService.create()
+# (quoted identifiers, dollar-quoted JSON, fixed 21-char ids) into piece_snapshot_sql()
+```
 
 ## Worker self-callback
 
