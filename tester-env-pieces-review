@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export AP_PIECES_SYNC_MODE=NONE
+exec "$(dirname "${BASH_SOURCE[0]}")/tester-env" "$@"
